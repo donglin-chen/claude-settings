@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>Claude 配置管理器</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 800px; margin: 20px auto; padding: 0 20px; background: #f9fafb; }
+  h2 { color: #333; }
+  .toolbar { display: flex; gap: 10px; margin: 15px 0; align-items: center; flex-wrap: wrap; }
+  button { padding: 8px 16px; border-radius: 8px; border: 1px solid #ccc; background: #fff; cursor: pointer; font-size: 14px; font-weight: 500; }
+  button:hover { background: #f3f4f6; }
+  button.primary { background: #2563eb; color: #fff; border-color: #2563eb; }
+  button.primary:hover { background: #1d4ed8; }
+  button.danger { background: #fef2f2; color: #dc2626; border-color: #fca5a5; }
+  button.small { padding: 4px 10px; font-size: 12px; }
+  
+  .profiles { border: 1px solid #e5e7eb; border-radius: 8px; background: #fff; margin-bottom: 15px; }
+  .profile-item { display: flex; align-items: center; gap: 10px; padding: 10px 15px; border-bottom: 1px solid #e5e7eb; }
+  .profile-item:last-child { border-bottom: none; }
+  .profile-item .name { flex: 1; font-weight: 500; }
+  .badge { font-size: 12px; background: #dcfce7; color: #16a34a; padding: 2px 6px; border-radius: 4px; }
+  
+  .editor { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; padding: 15px; display: none; margin-bottom: 15px; }
+  .form-item { margin-bottom: 12px; }
+  .form-item label { display: block; font-size: 13px; color: #555; margin-bottom: 4px; }
+  .form-item input { width: 100%; padding: 8px; border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box; }
+  textarea { width: 100%; height: 250px; padding: 10px; border: 1px solid #ccc; border-radius: 6px; font-family: monospace; box-sizing: border-box; }
+  
+  .status { font-size: 14px; margin: 10px 0; font-weight: bold; }
+  .ok { color: #16a34a; } .err { color: #dc2626; }
+</style>
+</head>
+<body>
+
+<h2>Claude 多平台配置管理器</h2>
+
+<div class="toolbar">
+  <button id="pickFile" class="primary">选择目标 settings.json</button>
+  <span id="targetInfo" style="font-size: 13px; color: #666;">检查权限中...</span>
+</div>
+
+<div class="status" id="status"></div>
+
+<div class="profiles" id="profileList"></div>
+
+<div class="toolbar">
+  <button id="newProfile">＋ 新增配置</button>
+  <button id="importJson">粘贴 JSON 新增</button>
+</div>
+
+<div class="editor" id="editorWrap">
+  <div style="display:flex; gap:10px; margin-bottom:10px;">
+    <input id="profileName" placeholder="配置名称（如 Kimi）" style="flex:1; padding:8px; border:1px solid #ccc; border-radius:6px;">
+    <button id="saveProfile" class="primary">保存配置</button>
+    <button id="cancelEdit">取消</button>
+  </div>
+  <div class="form-item"><label>ANTHROPIC_BASE_URL</label><input id="f_baseUrl"></div>
+  <div class="form-item"><label>ANTHROPIC_AUTH_TOKEN</label><input id="f_token"></div>
+  <div class="form-item"><label>ANTHROPIC_MODEL</label><input id="f_model"></div>
+  <div class="form-item">
+    <label>完整 JSON 编辑（或直接粘贴）</label>
+    <textarea id="jsonEditor"></textarea>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let profiles = [], activeId = null, editingId = null, fileHandle = null;
+const DB_NAME = 'ClaudeConfigDB';
+const STORE_NAME = 'handles';
+
+// --- IndexedDB 用于永久记住文件句柄 ---
+function openDB() {
+  return new Promise((res, rej) => {
+    const req = indexedDB.open(DB_NAME, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(STORE_NAME);
+    req.onsuccess = () => res(req.result);
+    req.onerror = () => rej(req.error);
+  });
+}
+async function saveHandle(handle) {
+  const db = await openDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    tx.objectStore(STORE_NAME).put(handle, 'settingsFile');
+    tx.oncomplete = res; tx.onerror = () => rej(tx.error);
+  });
+}
+async function getHandle() {
+  const db = await openDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(STORE_NAME, 'readonly');
+    const req = tx.objectStore(STORE_NAME).get('settingsFile');
+    req.onsuccess = () => res(req.result);
+    req.onerror = () => rej(req.error);
+  });
+}
+
+// --- 初始化配置数据 ---
+if (!localStorage.getItem('claude_profiles')) {
+  localStorage.setItem('claude_profiles', JSON.stringify([
+    { id: '1', name: 'Kimi (Moonshot)', json: JSON.stringify({ env: { ANTHROPIC_BASE_URL: 'https://api.moonshot.cn/anthropic', ANTHROPIC_AUTH_TOKEN: 'sk-xxx' } }, null, 2) },
+    { id: '2', name: 'DeepSeek', json: JSON.stringify({ env: { ANTHROPIC_BASE_URL: 'https://api.deepseek.com/anthropic', ANTHROPIC_AUTH_TOKEN: 'sk-xxx' } }, null, 2) }
+  ]));
+}
+profiles = JSON.parse(localStorage.getItem('claude_profiles'));
+
+function saveProfiles() { localStorage.setItem('claude_profiles', JSON.stringify(profiles)); renderList(); }
+function setStatus(msg, cls = '') { $('status').textContent = msg; $('status').className = 'status ' + cls; }
+
+// --- 渲染列表 ---
+function renderList() {
+  $('profileList').innerHTML = '';
+  profiles.forEach(p => {
+    const isActive = p.id === activeId;
+    const div = document.createElement('div');
+    div.className = 'profile-item';
+    div.innerHTML = `
+      <button class="small primary" onclick="applyConfig('${p.id}')">应用此配置</button>
+      <span class="name">${p.name} ${isActive ? '<span class="badge">已应用</span>' : ''}</span>
+      <button class="small" onclick="editProfile('${p.id}')">编辑</button>
+      <button class="small danger" onclick="deleteProfile('${p.id}')">删除</button>
+    `;
+    $('profileList').appendChild(div);
+  });
+}
+
+// --- 核心：写入文件 ---
+window.applyConfig = async (id) => {
+  if (!fileHandle) { setStatus('请先选择 settings.json 文件', 'err'); return; }
+  
+  // 检查权限是否还有效
+  const options = { mode: 'readwrite' };
+  if ((await fileHandle.queryPermission(options)) !== 'granted') {
+    if ((await fileHandle.requestPermission(options)) !== 'granted') {
+      setStatus('权限已过期，请重新选择文件授权。', 'err');
+      return;
+    }
+  }
+
+  const p = profiles.find(x => x.id === id);
+  try {
+    const writable = await fileHandle.createWritable();
+    await writable.write(p.json);
+    await writable.close();
+    activeId = id; renderList();
+    setStatus(`成功！已将「${p.name}」写入硬盘文件 ✓`, 'ok');
+  } catch (e) {
+    setStatus('写入失败：' + e.message, 'err');
+  }
+};
+
+// --- 选择并记住文件 ---
+$('pickFile').addEventListener('click', async () => {
+  try {
+    const [handle] = await window.showOpenFilePicker({ types: [{ description: 'JSON', accept: { 'application/json': ['.json'] } }] });
+    fileHandle = handle;
+    await saveHandle(handle); // 存入 IndexedDB，下次自动读取
+    $('targetInfo').textContent = '已绑定：' + handle.name + ' (已记住)';
+    setStatus('文件授权成功！以后打开网页会自动记住它。', 'ok');
+  } catch (e) {
+    if (e.name !== 'AbortError') setStatus('选择失败：' + e.message, 'err');
+  }
+});
+
+// --- 网页打开时自动恢复文件句柄 ---
+(async () => {
+  renderList();
+  try {
+    const handle = await getHandle();
+    if (handle) {
+      fileHandle = handle;
+      $('targetInfo').textContent = '已绑定：' + handle.name + ' (已记住)';
+      // 尝试静默确认权限（不行的话，点应用配置时会自动弹授权）
+      const perm = await handle.queryPermission({ mode: 'readwrite' });
+      if (perm === 'granted') {
+        setStatus('已自动恢复文件授权，直接点击「应用此配置」即可！', 'ok');
+      } else {
+        setStatus('已记住文件，首次点击「应用」需允许一次权限。', '');
+      }
+    } else {
+      $('targetInfo').textContent = '未绑定文件';
+    }
+  } catch(e) {
+    $('targetInfo').textContent = '未绑定文件';
+  }
+})();
+
+// --- 编辑器逻辑 ---
+window.editProfile = (id) => {
+  editingId = id;
+  const p = profiles.find(x => x.id === id);
+  $('editorWrap').style.display = 'block';
+  $('profileName').value = p.name;
+  $('jsonEditor').value = p.json;
+  try {
+    const env = JSON.parse(p.json).env || {};
+    $('f_baseUrl').value = env.ANTHROPIC_BASE_URL || '';
+    $('f_token').value = env.ANTHROPIC_AUTH_TOKEN || '';
+    $('f_model').value = env.ANTHROPIC_MODEL || '';
+  } catch(e){}
+};
+
+window.deleteProfile = (id) => {
+  if (!confirm('确认删除？')) return;
+  profiles = profiles.filter(x => x.id !== id);
+  saveProfiles();
+};
+
+$('newProfile').addEventListener('click', () => {
+  editingId = null;
+  $('editorWrap').style.display = 'block';
+  $('profileName').value = ''; $('jsonEditor').value = '{\n  "env": {}\n}';
+  $('f_baseUrl').value = ''; $('f_token').value = ''; $('f_model').value = '';
+});
+
+$('saveProfile').addEventListener('click', () => {
+  const name = $('profileName').value.trim();
+  if (!name) return setStatus('请输入名称', 'err');
+  
+  let jsonObj = {};
+  try { jsonObj = JSON.parse($('jsonEditor').value || '{}'); } catch(e) { return setStatus('JSON 格式错误', 'err'); }
+  jsonObj.env = jsonObj.env || {};
+  if ($('f_baseUrl').value) jsonObj.env.ANTHROPIC_BASE_URL = $('f_baseUrl').value;
+  if ($('f_token').value) jsonObj.env.ANTHROPIC_AUTH_TOKEN = $('f_token').value;
+  if ($('f_model').value) jsonObj.env.ANTHROPIC_MODEL = $('f_model').value;
+  const jsonStr = JSON.stringify(jsonObj, null, 2);
+
+  if (editingId) {
+    const p = profiles.find(x => x.id === editingId);
+    p.name = name; p.json = jsonStr;
+  } else {
+    profiles.push({ id: Date.now().toString(), name, json: jsonStr });
+  }
+  saveProfiles();
+  $('editorWrap').style.display = 'none';
+  setStatus('配置已保存', 'ok');
+});
+
+$('cancelEdit').addEventListener('click', () => { $('editorWrap').style.display = 'none'; });
+
+$('importJson').addEventListener('click', () => {
+  const text = prompt('粘贴完整 settings.json：');
+  if (!text) return;
+  try { JSON.parse(text); } catch(e) { return alert('JSON 格式错误'); }
+  const name = prompt('配置名称：') || '未命名';
+  profiles.push({ id: Date.now().toString(), name, json: text });
+  saveProfiles();
+});
+</script>
+</body>
+</html>
